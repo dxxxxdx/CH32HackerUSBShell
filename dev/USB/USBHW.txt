@@ -1,0 +1,857 @@
+/*
+* 具体任务处理函数。
+ * 目前全部只留入口。
+ */
+
+#include <stdint.h>
+
+#include "BSP.h"
+#include "system_IT.h"
+#include "ch32v20x.h"
+#include "ch32v20x_usb.h"
+#include <string.h>
+#include "USB_DESC.h"
+
+
+/*
+ * EP0 当前所处的控制传输阶段。
+ *
+ * IDLE:
+ *   没有正在执行的控制传输，等待下一笔 SETUP。
+ *
+ * DATA_IN:
+ *   Device-to-Host 数据阶段。
+ *   例如 GET_DESCRIPTOR 正在向主机发送描述符。
+ *
+ * STATUS_OUT:
+ *   DATA IN 已经结束，等待主机发送零长度 OUT 状态包。
+ *
+ * STATUS_IN:
+ *   Host-to-Device 请求已经处理完毕，
+ *   等待设备发送零长度 IN 状态包。
+ *
+ * 当前暂时不加入 DATA_OUT。
+ * 后面遇到需要接收数据阶段的类请求时再加。
+ */
+typedef enum
+{
+    USB_EP0_STAGE_IDLE = 0,
+    USB_EP0_STAGE_DATA_IN,
+    USB_EP0_STAGE_STATUS_OUT,
+    USB_EP0_STAGE_STATUS_IN
+} USBEndpoint0Stage;
+
+
+/*
+ * EP0 控制传输上下文。
+ *
+ * 这里只保存跨 USB transaction 必须保留的信息。
+ * 原始 SETUP 包不复制，仍然直接读取 EP0 DMA 缓冲区。
+ */
+typedef struct
+{
+    /*
+     * 当前控制传输阶段。
+     */
+    USBEndpoint0Stage stage;
+
+    /*
+     * 下一段待发送数据的地址。
+     *
+     * GET_DESCRIPTOR 的描述符通常位于 Flash，
+     * 每次最多复制一个 EP0 packet 到 DMA 缓冲区。
+     */
+    const uint8_t *inData;
+
+    /*
+     * 尚未发送的数据字节数。
+     */
+    uint16_t inRemaining;
+
+    /*
+     * 数据发送结束后是否还需要发送一个 ZLP。
+     *
+     * 当实际数据长度小于主机请求长度，
+     * 并且实际长度刚好是 EP0 最大包长的整数倍时，
+     * 需要额外发送零长度包结束 DATA IN。
+     */
+    uint8_t needsZLP;
+
+    /*
+     * SET_ADDRESS 请求中的新设备地址。
+     *
+     * USB 规定不能在收到 SETUP 后立刻修改 DEV_ADDR，
+     * 必须等 Status IN 成功完成后再写入。
+     */
+    uint8_t pendingAddress;
+
+    /*
+     * pendingAddress 当前是否有效。
+     */
+    uint8_t pendingAddressValid;
+} USBEndpoint0Context;
+
+
+/*
+ * 整个 USB 设备的软件状态。
+ *
+ * EP0 的传输状态放在 endpoint0 子结构中；
+ * 配置、Alternate Setting 和 ECM 状态属于设备层，
+ * 不混进 EP0 传输状态。
+ */
+typedef struct
+{
+    USBEndpoint0Context endpoint0;
+
+    /*
+     * 当前配置值：
+     *
+     * 0：未配置
+     * 1：CDC-ECM 配置已启用
+     */
+    uint8_t configurationValue;
+
+    /*
+     * ECM Data Interface 当前 Alternate Setting：
+     *
+     * 0：Bulk EP2/EP3 关闭
+     * 1：Bulk EP2/EP3 开启
+     */
+    uint8_t dataAlternateSetting;
+
+    /*
+     * 主机通过 CDC-ECM
+     * SET_ETHERNET_PACKET_FILTER 请求设置的过滤标志。
+     */
+    uint16_t ethernetPacketFilter;
+} USBDeviceContext;
+
+
+/*
+ * USB 设备唯一的软件上下文。
+ *
+ * 静态对象位于 BSS，启动时自动清零：
+ *
+ * endpoint0.stage       = USB_EP0_STAGE_IDLE
+ * configurationValue   = 0
+ * dataAlternateSetting = 0
+ */
+static USBDeviceContext usbDeviceContext;
+
+
+
+
+
+
+
+static void USB_HandleBusReset(void)
+{
+    usbDeviceContext =(USBDeviceContext){0};
+    BSP_USB_ResetEndpoints();
+}
+
+
+static void USB_HandleSuspend(void)
+{
+    /*
+     * TODO:
+     * 处理 Suspend/Resume 事件。
+     */
+}
+
+
+static void USB_HandleFIFOOverflow(void)
+{
+    /*
+     * TODO:
+     * 处理 USB FIFO overflow。
+     */
+}
+
+extern uint8_t bspUSBEndpoint0Buffer[
+    BSP_USB_EP0_PACKET_SIZE]
+    __attribute__((aligned(4)));
+
+static void USB_HandleGetDescriptor(
+    const volatile USB_SETUP_REQ *setup)
+{
+    /*
+     * GET_DESCRIPTOR 必须是 Device-to-Host 请求。
+     */
+    if ((setup->bRequestType &
+         USB_REQ_TYP_READ) == 0U)
+    {
+        USBFSD->UEP0_TX_CTRL =
+            USBFS_UEP_T_TOG |
+            USBFS_UEP_T_RES_STALL;
+
+        USBFSD->UEP0_RX_CTRL =
+            USBFS_UEP_R_TOG |
+            USBFS_UEP_R_RES_STALL;
+
+        return;
+    }
+
+    /*
+     * wValue：
+     *
+     * 高字节：Descriptor Type
+     * 低字节：Descriptor Index
+     */
+    const uint8_t descriptorType =
+        (uint8_t)(
+            setup->wValue >> 8U);
+
+    const uint8_t descriptorIndex =
+        (uint8_t)(
+            setup->wValue & 0x00FFU);
+
+    uint16_t descriptorLength = 0U;
+
+    /*
+     * USBDesc_GetDescriptor() 根据 Type 和 Index
+     * 返回对应描述符及其真实长度。
+     */
+    const uint8_t *const descriptor =
+        USBDesc_GetDescriptor(
+            descriptorType,
+            descriptorIndex,
+            &descriptorLength);
+
+    if (descriptor == NULL)
+    {
+        /*
+         * 不存在对应描述符。
+         */
+        USBFSD->UEP0_TX_CTRL =
+            USBFS_UEP_T_TOG |
+            USBFS_UEP_T_RES_STALL;
+
+        USBFSD->UEP0_RX_CTRL =
+            USBFS_UEP_R_TOG |
+            USBFS_UEP_R_RES_STALL;
+
+        return;
+    }
+
+    /*
+     * 实际发送长度不能超过主机在 wLength 中请求的长度。
+     */
+    uint16_t transferLength =
+        descriptorLength;
+
+    if (transferLength >
+        setup->wLength)
+    {
+        transferLength =
+            setup->wLength;
+    }
+
+    /*
+     * 保存后续 EP0 IN transaction 需要的状态。
+     *
+     * SETUP 包本身仍然没有复制。
+     */
+    usbDeviceContext.endpoint0.stage =
+        USB_EP0_STAGE_DATA_IN;
+
+    usbDeviceContext.endpoint0.inData =
+        descriptor;
+
+    usbDeviceContext.endpoint0.inRemaining =
+        transferLength;
+
+    /*
+     * 如果描述符比主机请求的长度短，并且描述符长度
+     * 正好是 EP0 最大包长的整数倍，需要额外发送 ZLP。
+     */
+    usbDeviceContext.endpoint0.needsZLP =
+        (
+            (transferLength < setup->wLength) &&
+            (
+                (transferLength %
+                 BSP_USB_EP0_PACKET_SIZE) == 0U
+            )
+        );
+
+    /*
+     * 当前只装载第一个 packet。
+     */
+    uint16_t packetLength =
+        transferLength;
+
+    if (packetLength >
+        BSP_USB_EP0_PACKET_SIZE)
+    {
+        packetLength =
+            BSP_USB_EP0_PACKET_SIZE;
+    }
+
+    /*
+     * 描述符位于 Flash，USBFS DMA 使用 SRAM，
+     * 因此将当前 packet 复制到 EP0 DMA 缓冲区。
+     */
+    if (packetLength != 0U)
+    {
+        memcpy(
+            bspUSBEndpoint0Buffer,
+            descriptor,
+            packetLength);
+
+        usbDeviceContext.endpoint0.inData +=
+            packetLength;
+
+        usbDeviceContext.endpoint0.inRemaining -=
+            packetLength;
+    }
+
+    USBFSD->UEP0_TX_LEN =
+        packetLength;
+
+    /*
+     * SETUP 后第一个 DATA IN packet 使用 DATA1。
+     */
+    USBFSD->UEP0_TX_CTRL =
+        USBFS_UEP_T_TOG |
+        USBFS_UEP_T_RES_ACK;
+}
+
+static void USB_Endpoint0ArmStatusIn(void)
+{
+    /*
+     * 准备响应下一次 EP0 IN token：
+     * 返回一个 DATA1 零长度包。
+     */
+    usbDeviceContext.endpoint0.stage =
+        USB_EP0_STAGE_STATUS_IN;
+
+    USBFSD->UEP0_TX_LEN = 0U;
+
+    USBFSD->UEP0_TX_CTRL =
+        USBFS_UEP_T_TOG |
+        USBFS_UEP_T_RES_ACK;
+}
+
+static void USB_HandleStandardRequest(
+    const volatile USB_SETUP_REQ *setup)
+{
+    switch (setup->bRequest)
+    {
+    case USB_GET_DESCRIPTOR:
+        {
+            USB_HandleGetDescriptor(
+                setup);
+            break;
+        }
+
+    case USB_SET_ADDRESS:
+        {
+            /*
+             * SET_ADDRESS 的合法格式：
+             *
+             * bmRequestType = 0x00
+             *   Host-to-Device
+             *   Standard
+             *   Device
+             *
+             * wValue  = 新地址，范围 0～127
+             * wIndex  = 0
+             * wLength = 0
+             */
+            if ((setup->bRequestType != 0x00U) ||
+                (setup->wValue >
+                 USBFS_USB_ADDR_MASK) ||
+                (setup->wIndex != 0U) ||
+                (setup->wLength != 0U))
+            {
+                USBFSD->UEP0_TX_CTRL =
+                    USBFS_UEP_T_TOG |
+                    USBFS_UEP_T_RES_STALL;
+
+                USBFSD->UEP0_RX_CTRL =
+                    USBFS_UEP_R_TOG |
+                    USBFS_UEP_R_RES_STALL;
+
+                break;
+            }
+
+            /*
+             * 此时不能写 DEV_ADDR。
+             *
+             * 主机发送 Status IN 时仍然使用旧地址，
+             * 必须等 Status IN 完成后再切换到新地址。
+             */
+            usbDeviceContext.endpoint0.pendingAddress =
+                (uint8_t)setup->wValue;
+
+            usbDeviceContext.endpoint0.pendingAddressValid =
+                1U;
+
+            USB_Endpoint0ArmStatusIn();
+
+            break;
+        }
+
+    case USB_GET_CONFIGURATION:
+    case USB_SET_CONFIGURATION:
+    case USB_GET_INTERFACE:
+    case USB_SET_INTERFACE:
+    case USB_GET_STATUS:
+        {
+            /*
+             * TODO:
+             * 后续逐个实现。
+             */
+            break;
+        }
+
+    default:
+        {
+            /*
+             * 当前不支持的标准请求。
+             */
+            USBFSD->UEP0_TX_CTRL =
+                USBFS_UEP_T_TOG |
+                USBFS_UEP_T_RES_STALL;
+
+            USBFSD->UEP0_RX_CTRL =
+                USBFS_UEP_R_TOG |
+                USBFS_UEP_R_RES_STALL;
+
+            break;
+        }
+    }
+}
+
+
+
+
+
+
+static void USB_HandleSetup(void)
+{
+    /*
+     * 新 SETUP 会终止上一笔未完成的 EP0 控制传输。
+     */
+    usbDeviceContext.endpoint0 =
+        (USBEndpoint0Context){0};
+
+    /*
+     * SETUP 后的数据阶段从 DATA1 开始。
+     *
+     * 请求尚未解析完成，因此两个方向暂时保持 NAK。
+     */
+    USBFSD->UEP0_TX_LEN = 0U;
+
+    USBFSD->UEP0_TX_CTRL =
+        USBFS_UEP_T_TOG |
+        USBFS_UEP_T_RES_NAK;
+
+    USBFSD->UEP0_RX_CTRL =
+        USBFS_UEP_R_TOG |
+        USBFS_UEP_R_RES_NAK;
+
+    /*
+     * DMA 已经把 SETUP packet 写入 EP0 缓冲区。
+     *
+     * USB_SETUP_REQ 使用 packed 保证字段布局与
+     * USB SETUP packet 完全一致。
+     *
+     * CH32V20x 与 USB 协议均使用小端序，
+     * 因此 wValue、wIndex 和 wLength 可以直接读取。
+     */
+    const volatile USB_SETUP_REQ *const setup =
+        (const volatile USB_SETUP_REQ *)
+        bspUSBEndpoint0Buffer;
+
+    /*
+     * bRequestType[6:5]：
+     *
+     * 00：Standard Request
+     * 01：Class Request
+     * 10：Vendor Request
+     * 11：Reserved
+     */
+    switch (setup->bRequestType &
+            USB_REQ_TYP_MASK)
+    {
+    case USB_REQ_TYP_STANDARD:
+        {
+
+            USB_HandleStandardRequest(setup);
+            break;
+        }
+
+    case USB_REQ_TYP_CLASS:
+        {
+            /*
+             * TODO:
+             * 后续实现 CDC-ECM Class Request。
+             */
+            break;
+        }
+
+    case USB_REQ_TYP_VENDOR:
+        {
+            /*
+             * 暂时不支持 Vendor Request。
+             */
+            USBFSD->UEP0_TX_CTRL =
+                USBFS_UEP_T_TOG |
+                USBFS_UEP_T_RES_STALL;
+
+            USBFSD->UEP0_RX_CTRL =
+                USBFS_UEP_R_TOG |
+                USBFS_UEP_R_RES_STALL;
+
+            break;
+        }
+
+    default:
+        {
+            /*
+             * Reserved Request Type。
+             */
+            USBFSD->UEP0_TX_CTRL =
+                USBFS_UEP_T_TOG |
+                USBFS_UEP_T_RES_STALL;
+
+            USBFSD->UEP0_RX_CTRL =
+                USBFS_UEP_R_TOG |
+                USBFS_UEP_R_RES_STALL;
+
+            break;
+        }
+    }
+}
+static void USB_HandleEndpoint0Out(
+    uint8_t interruptStatus)
+{
+    /*
+     * 当前不是 Status OUT。
+     * 暂时不处理。
+     */
+    if (usbDeviceContext.endpoint0.stage !=
+        USB_EP0_STAGE_STATUS_OUT)
+    {
+        return;
+    }
+
+    /*
+     * Toggle 不正确。
+     * 等主机重试，不要主动 STALL。
+     */
+    if ((interruptStatus &
+         USBFS_UIS_TOG_OK) == 0U)
+    {
+        return;
+    }
+
+    /*
+     * Status OUT 必须是零长度包。
+     */
+    if (USBFSD->RX_LEN != 0U)
+    {
+        return;
+    }
+
+    /*
+     * 本次控制传输完成。
+     */
+    usbDeviceContext.endpoint0 =
+        (USBEndpoint0Context){0};
+
+    USBFSD->UEP0_TX_LEN = 0U;
+
+    USBFSD->UEP0_TX_CTRL =
+        USBFS_UEP_T_RES_NAK;
+
+    USBFSD->UEP0_RX_CTRL =
+        USBFS_UEP_R_RES_ACK;
+}
+
+static void USB_HandleOut(
+    uint8_t endpointNumber,
+    uint8_t interruptStatus)
+{
+    if (endpointNumber == 0U)
+    {
+        USB_HandleEndpoint0Out(
+            interruptStatus);
+
+        return;
+    }
+
+    /*
+     * TODO:
+     * EP2 Ethernet Bulk OUT。
+     */
+}
+static void USB_HandleEndpoint0In(void)
+{
+    switch (usbDeviceContext.endpoint0.stage)
+    {
+    case USB_EP0_STAGE_STATUS_IN:
+        {
+            /*
+             * 主机已经收到并 ACK 了 Status IN 的
+             * DATA1 零长度包。
+             *
+             * SET_ADDRESS 到这里才算完成。
+             */
+            if (usbDeviceContext.endpoint0
+                    .pendingAddressValid != 0U)
+            {
+                /*
+                 * 现在主机和设备可以同时切换到新地址。
+                 */
+                BSP_USB_SetDeviceAddress(
+                    usbDeviceContext.endpoint0
+                        .pendingAddress);
+
+                usbDeviceContext.endpoint0
+                    .pendingAddressValid = 0U;
+            }
+
+            /*
+             * 本次 EP0 控制传输结束。
+             */
+            usbDeviceContext.endpoint0.stage =
+                USB_EP0_STAGE_IDLE;
+
+            /*
+             * EP0 IN 恢复 NAK，避免重复发送状态包。
+             *
+             * EP0 OUT 恢复 ACK，准备接收下一笔 SETUP。
+             */
+            USBFSD->UEP0_TX_LEN = 0U;
+
+            USBFSD->UEP0_TX_CTRL =
+                USBFS_UEP_T_RES_NAK;
+
+            USBFSD->UEP0_RX_CTRL =
+                USBFS_UEP_R_RES_ACK;
+
+            break;
+        }
+    case USB_EP0_STAGE_DATA_IN:
+    {
+        /*
+         * 还有描述符数据。
+         */
+        if (usbDeviceContext.endpoint0
+                .inRemaining != 0U)
+        {
+            uint16_t length =
+                usbDeviceContext.endpoint0
+                    .inRemaining;
+
+            if (length >
+                BSP_USB_EP0_PACKET_SIZE)
+            {
+                length =
+                    BSP_USB_EP0_PACKET_SIZE;
+            }
+
+            memcpy(
+                bspUSBEndpoint0Buffer,
+                usbDeviceContext.endpoint0
+                    .inData,
+                length);
+
+            usbDeviceContext.endpoint0.inData +=
+                length;
+
+            usbDeviceContext.endpoint0.inRemaining -=
+                length;
+
+            USBFSD->UEP0_TX_LEN =
+                length;
+
+            /*
+             * 翻转 DATA0/DATA1。
+             */
+            USBFSD->UEP0_TX_CTRL ^=
+                USBFS_UEP_T_TOG;
+
+            USBFSD->UEP0_TX_CTRL =
+                (
+                    USBFSD->UEP0_TX_CTRL &
+                    ~USBFS_UEP_T_RES_MASK
+                ) |
+                USBFS_UEP_T_RES_ACK;
+
+            break;
+        }
+
+        /*
+         * 需要补一个零长度包。
+         */
+        if (usbDeviceContext.endpoint0
+                .needsZLP != 0U)
+        {
+            usbDeviceContext.endpoint0
+                .needsZLP = 0U;
+
+            USBFSD->UEP0_TX_LEN = 0U;
+
+            USBFSD->UEP0_TX_CTRL ^=
+                USBFS_UEP_T_TOG;
+
+            USBFSD->UEP0_TX_CTRL =
+                (
+                    USBFSD->UEP0_TX_CTRL &
+                    ~USBFS_UEP_T_RES_MASK
+                ) |
+                USBFS_UEP_T_RES_ACK;
+
+            break;
+        }
+
+        /*
+         * 描述符发完。
+         * 等主机发 Status OUT。
+         */
+        usbDeviceContext.endpoint0.stage =
+            USB_EP0_STAGE_STATUS_OUT;
+
+        USBFSD->UEP0_TX_CTRL =
+            USBFS_UEP_T_RES_NAK;
+
+        USBFSD->UEP0_RX_CTRL =
+            USBFS_UEP_R_TOG |
+            USBFS_UEP_R_RES_ACK;
+
+        break;
+    }
+
+    default:
+        {
+            break;
+        }
+    }
+}
+
+static void USB_HandleIn(
+    uint8_t endpointNumber)
+{
+    if (endpointNumber == 0U)
+    {
+        USB_HandleEndpoint0In();
+        return;
+    }
+
+    /*
+     * TODO:
+     * EP1 Notification IN
+     * EP3 Ethernet Bulk IN
+     */
+}
+
+
+__attribute__((always_inline))
+static inline void USB_DispatchTransfer(
+    uint8_t interruptStatus)
+{
+    /*
+     * 不要过滤 USBFS_UIS_IS_NAK。
+     *
+     * 官方例程也是直接按 TOKEN 分发。
+     */
+    switch (interruptStatus &
+            USBFS_UIS_TOKEN_MASK)
+    {
+    case USBFS_UIS_TOKEN_SETUP:
+        {
+            /*
+             * 不读取 endpointNumber。
+             * SETUP 直接归 EP0。
+             */
+            USB_HandleSetup();
+            break;
+        }
+
+    case USBFS_UIS_TOKEN_OUT:
+        {
+            const uint8_t endpointNumber =
+                interruptStatus &
+                USBFS_UIS_ENDP_MASK;
+
+            USB_HandleOut(
+                endpointNumber,
+                interruptStatus);
+
+            break;
+        }
+
+    case USBFS_UIS_TOKEN_IN:
+        {
+            const uint8_t endpointNumber =
+                interruptStatus &
+                USBFS_UIS_ENDP_MASK;
+
+            USB_HandleIn(
+                endpointNumber);
+
+            break;
+        }
+
+    default:
+        {
+            break;
+        }
+    }
+}
+void USBFS_IRQHandler(void)
+{
+    const uint8_t interruptFlags =
+        USBFSD->INT_FG;
+
+    const uint8_t interruptStatus =
+        USBFSD->INT_ST;
+
+    /*
+     * 官方代码优先处理 TRANSFER。
+     */
+    if ((interruptFlags &
+         USBFS_UIF_TRANSFER) != 0U)
+    {
+        USB_DispatchTransfer(
+            interruptStatus);
+
+        USBFSD->INT_FG =
+            USBFS_UIF_TRANSFER;
+    }
+    else if ((interruptFlags &
+              USBFS_UIF_BUS_RST) != 0U)
+    {
+        USB_HandleBusReset();
+
+        USBFSD->INT_FG =
+            USBFS_UIF_BUS_RST;
+    }
+    else if ((interruptFlags &
+              USBFS_UIF_SUSPEND) != 0U)
+    {
+        USB_HandleSuspend();
+
+        USBFSD->INT_FG =
+            USBFS_UIF_SUSPEND;
+    }
+    else if ((interruptFlags &
+              USBFS_UIF_FIFO_OV) != 0U)
+    {
+        USB_HandleFIFOOverflow();
+
+        USBFSD->INT_FG =
+            USBFS_UIF_FIFO_OV;
+    }
+    else
+    {
+        /*
+         * 清除其余已置位的可写清零标志。
+         */
+        USBFSD->INT_FG =
+            interruptFlags;
+    }
+}

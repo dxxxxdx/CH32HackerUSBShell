@@ -1,0 +1,9 @@
+[12:23:51] **** 增量构建工程CH32V203C8U的活动配置obj ****
+make -j32 all
+make --no-print-directory main-build
+riscv-none-embed-size --format=berkeley "CH32V203C8U.elf"
+   text	   data	    bss	    dec	    hex	filename
+   7936	    152	   2072	  10160	   27b0	CH32V203C8U.elf
+
+[12:23:51] Generated CH32V203C8U.hex
+[12:23:51] 编译完成 (耗时327ms)
